@@ -1,233 +1,408 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { RealtimePostgresChangesPayload } from "@supabase/supabase-js";
 import type { MenuItem, Order, OrderStatus } from "@/types/shared";
+import OrderCard from "@/components/partner/OrderCard";
+import { TONE_ROW, nextStatus, statusTone } from "@/lib/order-status";
+import { supabase } from "@/lib/supabaseClient";
+import { logOrderEvent } from "@/lib/analytics/logOrderEvent";
+import { mapDbOrderToAppOrder, type DbOrderRow } from "@/lib/adapters/order";
+import { slotStartLabel, slotStartMillis } from "@/lib/parseSlotTime";
 
 // ---------------------------------------------------------------------------
-// Mock data — replace with a fetch from the orders API once the backend exists.
+// Data source
 // ---------------------------------------------------------------------------
 
-const RESTAURANT_ID = "rest_qazan_house";
+const RESTAURANT_ID = process.env.NEXT_PUBLIC_ALMA_RESTAURANT_ID ?? "";
+if (!RESTAURANT_ID) {
+  console.error("[orders] NEXT_PUBLIC_ALMA_RESTAURANT_ID is not set — the dashboard has no restaurant to load.");
+}
 
-const MOCK_MENU: MenuItem[] = [
-  { id: "mi_beshbarmak", restaurantId: RESTAURANT_ID, name: "Бешбармак", price: 3200, isAvailable: true, category: "Main" },
-  { id: "mi_manty", restaurantId: RESTAURANT_ID, name: "Манты (6 шт)", price: 2100, isAvailable: true, category: "Main" },
-  { id: "mi_baursak", restaurantId: RESTAURANT_ID, name: "Баурсаки", price: 800, isAvailable: true, category: "Sides" },
-  { id: "mi_shubat", restaurantId: RESTAURANT_ID, name: "Шубат 0.5л", price: 900, isAvailable: true, category: "Drinks" },
-  { id: "mi_tea", restaurantId: RESTAURANT_ID, name: "Чай с молоком", price: 500, isAvailable: true, category: "Drinks" },
+/** Orders joined with their slot so each row carries pickup_slots.slot_time. */
+const ORDERS_SELECT = "*, pickup_slots(slot_time)";
+
+/** menu_items row subset the dashboard needs for item names. */
+interface DbMenuItemRow {
+  id: string;
+  title: string | null;
+  price: number | string | null;
+  is_available: boolean | null;
+  category: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Status helpers
+// ---------------------------------------------------------------------------
+
+type FilterKey = "all" | "new" | "preparing" | "ready";
+
+const FILTERS: { key: FilterKey; label: string; statuses: OrderStatus[] | null }[] = [
+  { key: "all", label: "Все", statuses: null },
+  { key: "new", label: "New", statuses: ["Created"] },
+  { key: "preparing", label: "Preparing", statuses: ["Preparing", "Delayed"] },
+  { key: "ready", label: "Ready", statuses: ["Ready"] },
 ];
 
-const MOCK_ORDERS: Order[] = [
-  {
-    id: "ord_001",
-    orderNumber: "A-1042",
-    restaurantId: RESTAURANT_ID,
-    guestSessionId: "gs_7f3a",
-    pickupSlotId: "slot_1230",
-    status: "Paid",
-    totalAmount: 5300,
-    qrToken: "qr_9d2c1e",
-    items: [
-      { id: "oi_1", menuItemId: "mi_beshbarmak", quantity: 1, priceAtOrder: 3200 },
-      { id: "oi_2", menuItemId: "mi_manty", quantity: 1, priceAtOrder: 2100 },
-    ],
-    createdAt: "2026-09-19T12:04:00+05:00",
-    slotTime: "2026-09-19T12:30:00+05:00",
-  },
-  {
-    id: "ord_002",
-    orderNumber: "A-1043",
-    restaurantId: RESTAURANT_ID,
-    guestSessionId: "gs_b81e",
-    pickupSlotId: "slot_1245",
-    status: "Preparing",
-    totalAmount: 5000,
-    qrToken: "qr_44a0f7",
-    items: [
-      { id: "oi_3", menuItemId: "mi_manty", quantity: 2, priceAtOrder: 2100 },
-      { id: "oi_4", menuItemId: "mi_baursak", quantity: 1, priceAtOrder: 800 },
-    ],
-    createdAt: "2026-09-19T12:11:00+05:00",
-    slotTime: "2026-09-19T12:45:00+05:00",
-  },
-  {
-    id: "ord_003",
-    orderNumber: "A-1041",
-    restaurantId: RESTAURANT_ID,
-    guestSessionId: "gs_c052",
-    pickupSlotId: "slot_1215",
-    status: "Ready",
-    totalAmount: 1400,
-    qrToken: "qr_e13b9a",
-    items: [
-      { id: "oi_5", menuItemId: "mi_shubat", quantity: 1, priceAtOrder: 900 },
-      { id: "oi_6", menuItemId: "mi_tea", quantity: 1, priceAtOrder: 500 },
-    ],
-    createdAt: "2026-09-19T11:52:00+05:00",
-    readyAt: "2026-09-19T12:09:00+05:00",
-    slotTime: "2026-09-19T12:15:00+05:00",
-  },
-];
+/**
+ * Sort key: pickup slot start ascending; orders without a (parseable) slot go
+ * last. slotTime is the raw "17:00 - 17:15" range, so it goes through
+ * parseSlotStart rather than being compared as a string.
+ */
+function slotMillis(order: Order, referenceDate?: Date) {
+  return slotStartMillis(order.slotTime, referenceDate);
+}
 
 // ---------------------------------------------------------------------------
-// Presentation helpers
+// Compact ("Сейчас") view helpers
 // ---------------------------------------------------------------------------
 
-const STATUS_STYLES: Record<OrderStatus, { label: string; className: string }> = {
-  Created: { label: "Создан", className: "bg-slate-100 text-slate-700 ring-slate-200" },
-  Paid: { label: "Оплачен", className: "bg-blue-50 text-blue-700 ring-blue-200" },
-  Accepted: { label: "Принят", className: "bg-indigo-50 text-indigo-700 ring-indigo-200" },
-  Preparing: { label: "Готовится", className: "bg-amber-50 text-amber-700 ring-amber-200" },
-  Ready: { label: "Готов", className: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
-  PickedUp: { label: "Выдан", className: "bg-slate-100 text-slate-500 ring-slate-200" },
-  Cancelled: { label: "Отменён", className: "bg-rose-50 text-rose-700 ring-rose-200" },
-  Rejected: { label: "Отклонён", className: "bg-rose-50 text-rose-700 ring-rose-200" },
-  NoShow: { label: "Не пришёл", className: "bg-rose-50 text-rose-700 ring-rose-200" },
-  Delayed: { label: "Задержка", className: "bg-orange-50 text-orange-700 ring-orange-200" },
+const STATUS_LABEL: Record<OrderStatus, string> = {
+  Created: "Новый",
+  Preparing: "Готовим",
+  Ready: "Готов",
+  PickedUp: "Выдан",
+  Cancelled: "Отменён",
+  Rejected: "Отклонён",
+  NoShow: "Не пришёл",
+  Delayed: "Задержка",
 };
 
-/** The primary action a restaurant can take from a given status. */
-const NEXT_ACTION: Partial<Record<OrderStatus, string>> = {
-  Paid: "Принять заказ",
-  Accepted: "Начать готовить",
-  Preparing: "Заказ готов",
-  Ready: "Выдать заказ",
-};
+/** Statuses where the kitchen still owes work — a near/overdue slot here is a delay. */
+const PRE_READY_STATUSES: OrderStatus[] = ["Created", "Preparing", "Delayed"];
 
-const menuById = new Map(MOCK_MENU.map((m) => [m.id, m]));
+/** Pickup slots this close to now (or already passed) are flagged as urgent. */
+const URGENT_WINDOW_MS = 5 * 60 * 1000;
 
-const timeFormatter = new Intl.DateTimeFormat("ru-KZ", {
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-  timeZone: "Asia/Almaty",
-});
-
-const currencyFormatter = new Intl.NumberFormat("ru-KZ", {
-  style: "currency",
-  currency: "KZT",
-  maximumFractionDigits: 0,
-});
-
-function formatTime(iso?: string) {
-  return iso ? timeFormatter.format(new Date(iso)) : "—";
+function isUrgent(order: Order, now: number | null) {
+  if (now === null || !order.slotTime) return false;
+  if (!PRE_READY_STATUSES.includes(order.status)) return false;
+  const start = slotMillis(order, new Date(now));
+  if (!Number.isFinite(start)) return false; // unparseable slot — can't judge urgency
+  return start - now <= URGENT_WINDOW_MS;
 }
 
-function StatusBadge({ status }: { status: OrderStatus }) {
-  const { label, className } = STATUS_STYLES[status];
-  return (
-    <span
-      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${className}`}
-    >
-      {label}
-    </span>
-  );
+/**
+ * Row background for the compact view. Urgency is a time-based override, not a
+ * status colour, so it stays here and always wins; everything else defers to
+ * the shared status mapping in lib/order-status.ts.
+ */
+function compactRowClass(order: Order, now: number | null) {
+  if (isUrgent(order, now)) return "bg-red-600 text-white";
+  return TONE_ROW[statusTone(order.status)];
 }
 
-function SummaryTile({ label, value, accent }: { label: string; value: number; accent: string }) {
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</div>
-      <div className={`mt-1 text-3xl font-semibold tabular-nums ${accent}`}>{value}</div>
-    </div>
-  );
-}
-
-function OrderCard({ order }: { order: Order }) {
-  const action = NEXT_ACTION[order.status];
-
-  return (
-    <article className="flex flex-col rounded-xl border border-slate-200 bg-white shadow-sm">
-      <header className="flex items-start justify-between gap-3 border-b border-slate-100 px-4 py-3">
-        <div>
-          <div className="text-lg font-semibold text-slate-900">№ {order.orderNumber}</div>
-          <div className="text-xs text-slate-500">Создан в {formatTime(order.createdAt)}</div>
-        </div>
-        <StatusBadge status={order.status} />
-      </header>
-
-      <div className="grid grid-cols-2 gap-3 px-4 py-3 text-sm">
-        <div>
-          <div className="text-xs text-slate-500">Слот выдачи</div>
-          <div className="font-medium tabular-nums text-slate-900">{formatTime(order.slotTime)}</div>
-        </div>
-        <div>
-          <div className="text-xs text-slate-500">Готов в</div>
-          <div className="font-medium tabular-nums text-slate-900">{formatTime(order.readyAt)}</div>
-        </div>
-      </div>
-
-      <ul className="flex-1 space-y-1.5 border-t border-slate-100 px-4 py-3 text-sm">
-        {order.items.map((item) => {
-          const menuItem = menuById.get(item.menuItemId);
-          return (
-            <li key={item.id} className="flex items-baseline justify-between gap-3">
-              <span className="text-slate-800">
-                <span className="mr-1.5 font-semibold tabular-nums text-slate-500">{item.quantity}×</span>
-                {menuItem?.name ?? item.menuItemId}
-              </span>
-              <span className="tabular-nums text-slate-600">
-                {currencyFormatter.format(item.priceAtOrder * item.quantity)}
-              </span>
-            </li>
-          );
-        })}
-      </ul>
-
-      <footer className="flex items-center justify-between gap-3 border-t border-slate-100 px-4 py-3">
-        <div>
-          <div className="text-xs text-slate-500">Итого</div>
-          <div className="text-base font-semibold tabular-nums text-slate-900">
-            {currencyFormatter.format(order.totalAmount)}
-          </div>
-        </div>
-        {action ? (
-          <button
-            type="button"
-            className="rounded-lg bg-emerald-600 px-3.5 py-2 text-sm font-medium text-white hover:bg-emerald-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2"
-          >
-            {action}
-          </button>
-        ) : null}
-      </footer>
-    </article>
-  );
+function formatSlot(order: Order) {
+  return slotStartLabel(order.slotTime) ?? "--:--";
 }
 
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
-const ACTIVE_STATUSES: OrderStatus[] = ["Paid", "Accepted", "Preparing", "Ready", "Delayed"];
-
 export default function PartnerOrdersPage() {
-  const orders = MOCK_ORDERS;
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [menuItemsById, setMenuItemsById] = useState<Record<string, MenuItem>>({});
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<FilterKey>("all");
+  const [compact, setCompact] = useState(false);
 
-  const countBy = (statuses: OrderStatus[]) =>
-    orders.filter((o) => statuses.includes(o.status)).length;
+  // slot_id → slot_time. Realtime payloads carry only the raw row (no joined
+  // pickup_slots), so INSERT/UPDATE resolve their slot label from this map
+  // and fall back to a one-row query for slots we haven't seen yet.
+  const slotTimeById = useRef<Map<string, string>>(new Map());
+
+  const resolveSlotTime = useCallback(async (slotId: string | null): Promise<string | undefined> => {
+    if (!slotId) return undefined;
+    const cached = slotTimeById.current.get(slotId);
+    if (cached) return cached;
+    const { data, error } = await supabase.from("pickup_slots").select("slot_time").eq("id", slotId).maybeSingle();
+    if (error) {
+      console.warn(`[orders] could not load slot_time for slot ${slotId}:`, error.message);
+      return undefined;
+    }
+    if (data?.slot_time) slotTimeById.current.set(slotId, data.slot_time);
+    return data?.slot_time ?? undefined;
+  }, []);
+
+  // Wall clock for the urgency rule. Starts null so server and first client
+  // render agree (no hydration mismatch), then ticks every 15s.
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Initial load: menu (for item names), slots (lookup map), orders + slot.
+  useEffect(() => {
+    if (!RESTAURANT_ID) {
+      setLoadState("error");
+      setLoadError("NEXT_PUBLIC_ALMA_RESTAURANT_ID не задан");
+      return;
+    }
+    let cancelled = false;
+
+    (async () => {
+      const [menuRes, slotsRes, ordersRes] = await Promise.all([
+        supabase.from("menu_items").select("id, title, price, is_available, category").eq("restaurant_id", RESTAURANT_ID),
+        supabase.from("pickup_slots").select("id, slot_time").eq("restaurant_id", RESTAURANT_ID),
+        supabase.from("orders").select(ORDERS_SELECT).eq("restaurant_id", RESTAURANT_ID),
+      ]);
+      if (cancelled) return;
+
+      if (menuRes.error) console.warn("[orders] menu_items load failed:", menuRes.error.message);
+      else {
+        const rows = (menuRes.data ?? []) as DbMenuItemRow[];
+        setMenuItemsById(
+          Object.fromEntries(
+            rows.map((m) => [
+              m.id,
+              {
+                id: m.id,
+                restaurantId: RESTAURANT_ID,
+                name: m.title ?? m.id,
+                price: Number(m.price ?? 0),
+                isAvailable: m.is_available ?? true,
+                category: m.category ?? undefined,
+              } satisfies MenuItem,
+            ]),
+          ),
+        );
+      }
+
+      if (slotsRes.error) console.warn("[orders] pickup_slots load failed:", slotsRes.error.message);
+      else {
+        for (const slot of slotsRes.data ?? []) {
+          if (slot.id && slot.slot_time) slotTimeById.current.set(slot.id, slot.slot_time);
+        }
+      }
+
+      if (ordersRes.error) {
+        console.error("[orders] orders load failed:", ordersRes.error);
+        setLoadError(ordersRes.error.message);
+        setLoadState("error");
+        return;
+      }
+
+      const rows = (ordersRes.data ?? []) as unknown as DbOrderRow[];
+      // The exact shape of orders.items (jsonb) isn't confirmed yet — surface
+      // one raw row so the adapter's assumptions can be checked in DevTools.
+      if (rows[0]) console.log("[orders] sample raw row:", rows[0]);
+      const mapped = rows.map((r) => mapDbOrderToAppOrder(r));
+      setOrders(mapped);
+      setLoadState("ready");
+
+      console.log(`[orders] loaded ${mapped.length} orders for restaurant ${RESTAURANT_ID}`);
+      const withSlot = mapped.find((o) => o.slotTime);
+      if (withSlot) {
+        console.log(
+          `[orders] rush-hour check uses parsed slot start: "${withSlot.slotTime}" → ${new Date(slotMillis(withSlot)).toISOString()} (not string comparison)`,
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Realtime: keep the list in sync with every change to this restaurant's orders.
+  useEffect(() => {
+    if (!RESTAURANT_ID) return;
+
+    const handleChange = async (payload: RealtimePostgresChangesPayload<DbOrderRow>) => {
+      if (payload.eventType === "DELETE") {
+        const id = (payload.old as Partial<DbOrderRow>).id;
+        if (id) setOrders((prev) => prev.filter((o) => o.id !== id));
+        return;
+      }
+
+      const row = payload.new;
+      const slotTime = await resolveSlotTime(row.slot_id);
+      const incoming = mapDbOrderToAppOrder(row, slotTime);
+
+      if (payload.eventType === "INSERT") {
+        setOrders((prev) => (prev.some((o) => o.id === incoming.id) ? prev : [...prev, incoming]));
+        return;
+      }
+
+      // UPDATE: merge changed fields into the local order; if the row is new
+      // to us (e.g. inserted while we were offline) just add it.
+      setOrders((prev) => {
+        const idx = prev.findIndex((o) => o.id === incoming.id);
+        if (idx === -1) return [...prev, incoming];
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], ...incoming, slotTime: incoming.slotTime ?? prev[idx].slotTime };
+        return next;
+      });
+    };
+
+    const channel = supabase
+      .channel("orders-changes")
+      .on<DbOrderRow>(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "orders", filter: `restaurant_id=eq.${RESTAURANT_ID}` },
+        (payload) => {
+          void handleChange(payload);
+        },
+      )
+      .subscribe((status, err) => {
+        if (status === "SUBSCRIBED") console.log("[orders] realtime subscribed to orders changes");
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.error(`[orders] realtime ${status}`, err ?? "");
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [resolveSlotTime]);
+
+  // Persist the next pipeline status. No optimistic local update: the realtime
+  // subscription above reflects the confirmed row back into state, so
+  // updating here too would double-apply and flicker.
+  const handleAdvanceStatus = async (orderId: string) => {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return;
+    const next = nextStatus(order.status);
+    if (!next) return;
+    const { error } = await supabase.from("orders").update({ status: next }).eq("id", orderId);
+    if (error) {
+      console.error(`[orders] failed to advance ${order.orderNumber} to ${next}:`, error.message);
+      return;
+    }
+    logOrderEvent(orderId, next);
+  };
+
+  const countFor = (statuses: OrderStatus[] | null) =>
+    statuses ? orders.filter((o) => statuses.includes(o.status)).length : orders.length;
+
+  const visibleOrders = useMemo(() => {
+    const active = FILTERS.find((f) => f.key === filter)?.statuses ?? null;
+    return orders
+      .filter((o) => (active ? active.includes(o.status) : true))
+      .sort((a, b) => slotMillis(a) - slotMillis(b));
+  }, [orders, filter]);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900">Заказы</h1>
-          <p className="text-sm text-slate-500">Активные заказы на самовывоз</p>
-        </div>
-        <div className="text-sm text-slate-500">
-          Всего активных:{" "}
-          <span className="font-semibold text-slate-900">{countBy(ACTIVE_STATUSES)}</span>
+          <h1 className="text-3xl font-bold tracking-tight text-gray-900">Заказы</h1>
+          <p className="mt-1 text-sm text-gray-500">Отсортированы по времени получения</p>
         </div>
       </div>
 
-      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <SummaryTile label="Новые" value={countBy(["Paid"])} accent="text-blue-700" />
-        <SummaryTile label="Принято" value={countBy(["Accepted"])} accent="text-indigo-700" />
-        <SummaryTile label="Готовится" value={countBy(["Preparing", "Delayed"])} accent="text-amber-700" />
-        <SummaryTile label="Готово к выдаче" value={countBy(["Ready"])} accent="text-emerald-700" />
-      </section>
+      {/*
+        Filter tabs + view toggle — large targets for gloved hands.
+        On narrow screens the row scrolls horizontally (scrollbar hidden) rather
+        than squeezing tabs into each other. The outer div bleeds into the page
+        gutter (-mx / px pairs match <main>'s padding in the partner layout) so
+        the row scrolls edge-to-edge; the inner row is `w-max min-w-full` so its
+        trailing padding is part of the scrollable content. From `md:` up the
+        tabs grow to fill the width, so desktop looks as before.
+      */}
+      <div className="scrollbar-hide -mx-4 -my-1 overflow-x-auto sm:-mx-6 lg:mx-0">
+        {/* py-1 leaves room for the 4px rings, which overflow-x:auto would otherwise clip */}
+        <div className="flex w-max min-w-full flex-nowrap items-stretch gap-2 px-4 py-1 sm:px-6 lg:px-0">
+          <div
+            role="tablist"
+            aria-label="Фильтр по статусу"
+            className="flex flex-1 flex-nowrap items-stretch gap-2"
+          >
+            {FILTERS.map((f) => {
+              const selected = f.key === filter;
+              return (
+                <button
+                  key={f.key}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => setFilter(f.key)}
+                  className={`flex min-h-[3rem] flex-shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-full px-5 text-base font-bold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 focus-visible:ring-offset-2 md:flex-1 ${
+                    selected
+                      ? "bg-gray-900 text-white"
+                      : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                  }`}
+                >
+                  <span>{f.label}</span>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-sm tabular-nums ${
+                      selected ? "bg-white/20 text-white" : "bg-white text-gray-500"
+                    }`}
+                  >
+                    {countFor(f.statuses)}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
 
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {orders.map((order) => (
-          <OrderCard key={order.id} order={order} />
-        ))}
-      </section>
+          {/* "Сейчас" — rush-hour compact list toggle */}
+          <button
+            type="button"
+            aria-pressed={compact}
+            onClick={() => setCompact((v) => !v)}
+            className={`flex min-h-[3rem] flex-shrink-0 items-center justify-center whitespace-nowrap rounded-full px-5 text-base font-bold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 focus-visible:ring-offset-2 ${
+              compact
+                ? "bg-gray-900 text-white"
+                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+            }`}
+          >
+            Сейчас
+          </button>
+        </div>
+      </div>
+
+      {loadState === "loading" ? (
+        <div className="rounded-2xl border border-dashed border-gray-200 bg-white px-6 py-16 text-center text-lg font-medium text-gray-500">
+          Загружаем заказы…
+        </div>
+      ) : loadState === "error" ? (
+        <div
+          role="alert"
+          className="rounded-2xl border border-rose-200 bg-rose-50 px-6 py-16 text-center text-lg font-medium text-rose-700"
+        >
+          Не удалось загрузить заказы{loadError ? `: ${loadError}` : ""}
+        </div>
+      ) : visibleOrders.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-gray-200 bg-white px-6 py-16 text-center text-lg font-medium text-gray-500">
+          Нет заказов в этой категории
+        </div>
+      ) : compact ? (
+        <ul aria-label="Список заказов" className="space-y-2">
+          {visibleOrders.map((order) => (
+            <li
+              key={order.id}
+              className={`flex items-center gap-2 rounded-xl px-4 py-4 text-lg font-bold leading-none sm:gap-3 sm:text-xl ${compactRowClass(order, now)}`}
+            >
+              <span className="shrink-0 font-mono tabular-nums">{formatSlot(order)}</span>
+              <span aria-hidden="true">—</span>
+              <span className="shrink-0 whitespace-nowrap">№{order.orderNumber}</span>
+              <span aria-hidden="true">—</span>
+              <span className="min-w-0 truncate">{STATUS_LABEL[order.status]}</span>
+              {isUrgent(order, now) ? (
+                <span className="ml-auto hidden shrink-0 text-base font-extrabold uppercase tracking-wide sm:inline">
+                  Срочно
+                </span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <section className="grid grid-cols-1 gap-5 lg:grid-cols-2 2xl:grid-cols-3">
+          {visibleOrders.map((order) => (
+            <OrderCard
+              key={order.id}
+              order={order}
+              menuItemsById={menuItemsById}
+              onAdvanceStatus={handleAdvanceStatus}
+            />
+          ))}
+        </section>
+      )}
     </div>
   );
 }

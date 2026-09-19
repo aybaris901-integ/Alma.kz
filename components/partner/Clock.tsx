@@ -27,10 +27,10 @@ export default function Clock() {
 
   return (
     <div className="text-right leading-tight" suppressHydrationWarning>
-      <div className="font-mono text-xl font-semibold tabular-nums text-slate-900">
+      <div className="font-mono text-base font-medium tabular-nums text-gray-500">
         {now ? formatter.format(now) : "--:--:--"}
       </div>
-      <div className="text-xs text-slate-500">
+      <div className="text-xs text-gray-400">
         {now ? dateFormatter.format(now) : "\u00a0"}
       </div>
     </div>
