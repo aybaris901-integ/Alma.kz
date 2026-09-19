@@ -19,7 +19,7 @@ import type { OrderStatus } from "@/types/shared";
  * can never disagree about what a status is.
  */
 export const PIPELINE: { status: OrderStatus; label: string }[] = [
-  { status: "Created", label: "Начать готовить" },
+  { status: "Created", label: "Готовить" },
   { status: "Preparing", label: "Готово" },
   { status: "Ready", label: "Выдать" },
   { status: "PickedUp", label: "Выдан" },
