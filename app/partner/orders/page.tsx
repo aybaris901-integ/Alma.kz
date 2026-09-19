@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RealtimePostgresChangesPayload } from "@supabase/supabase-js";
 import type { MenuItem, Order, OrderStatus } from "@/types/shared";
 import OrderCard from "@/components/partner/OrderCard";
+import AnalyticsSummary from "@/components/partner/AnalyticsSummary";
 import { TONE_ROW, nextStatus, statusTone } from "@/lib/order-status";
 import { supabase } from "@/lib/supabaseClient";
 import { logOrderEvent } from "@/lib/analytics/logOrderEvent";
@@ -294,6 +295,8 @@ export default function PartnerOrdersPage() {
           <p className="mt-1 text-sm text-gray-500">Отсортированы по времени получения</p>
         </div>
       </div>
+
+      <AnalyticsSummary orders={orders} />
 
       {/*
         Filter tabs + view toggle — large targets for gloved hands.
